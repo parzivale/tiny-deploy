@@ -39,6 +39,8 @@ in {
     # ── Users ─────────────────────────────────────────────────────────────
     users.mutableUsers = false;
     services.userborn.enable = true;
+    # I want to be locked out
+    users.allowNoPasswordLogin = true;
     users.users.root = {
       hashedPassword = "!";
       shell = pkgs.shadow;
