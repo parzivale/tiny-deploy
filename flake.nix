@@ -86,6 +86,10 @@
         tiny-deploy = craneLib.buildPackage (commonArgs
           // {
             inherit cargoArtifacts;
+            meta = {
+              mainProgram = "deploy-shell";
+              shellPath = "/bin/deploy-shell";
+            };
           });
       in {
         _module.args.pkgs = import inputs.nixpkgs {
