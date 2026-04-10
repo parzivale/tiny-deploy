@@ -32,12 +32,13 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
+    system.etc.overlay.enable = true;
     # ── Nix ───────────────────────────────────────────────────────────────
     nix.enable = false;
 
     # ── Users ─────────────────────────────────────────────────────────────
     users.mutableUsers = false;
-
+    services.userborn.enable = true;
     users.users.root = {
       hashedPassword = "!";
       shell = pkgs.shadow;
