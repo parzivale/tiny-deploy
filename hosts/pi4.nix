@@ -14,11 +14,6 @@
   system.nixos-init.enable = true;
   boot.initrd.systemd.enable = true;
 
-  boot.initrd.availableKernelModules = [
-    "usbhid" "usb_storage"
-  ];
-  boot.kernelModules = [];
-  boot.initrd.includeDefaultModules = false;
   boot.kernelParams = ["quiet"];
 
   # aarch64
