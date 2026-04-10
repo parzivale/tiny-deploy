@@ -131,7 +131,7 @@ in {
 
     boot.kernelPackages = pkgs.linuxPackagesFor (pkgs.linux.override {
       ignoreConfigErrors = true;
-      structuredExtraConfig = with lib.kernel; {
+      structuredExtraConfig = with lib.kernel; lib.mapAttrs (_: lib.mkForce) {
         # Monolithic kernel: no loadable modules, everything needed is builtin.
         MODULES = no;
 
