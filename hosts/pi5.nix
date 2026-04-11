@@ -7,15 +7,9 @@
     (modulesPath + "/profiles/minimal.nix")
   ];
 
-  # ── Boot ──────────────────────────────────────────────────────────────
-  boot.loader.grub.enable = false;
-  boot.loader.generic-extlinux-compatible.enable = true;
-
-  system.nixos-init.enable = true;
-  boot.initrd.systemd.enable = true;
-
-  boot.kernelParams = ["quiet"];
-
-  # aarch64
+  # Boots via EDK2 UEFI firmware (worproject/rpi5-uefi) flashed to the
+  # board's SPI EEPROM or written to a separate firmware partition. Once
+  # UEFI is in place, the rest is handled by the shared module.nix
+  # (systemd-boot + image.repart).
   nixpkgs.hostPlatform = lib.mkDefault "aarch64-linux";
 }

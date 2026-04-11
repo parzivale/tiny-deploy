@@ -2,10 +2,15 @@
   config,
   pkgs,
   lib,
+  modulesPath,
   ...
 }: let
   cfg = config.services.tiny-deploy;
 in {
+  imports = [
+    (modulesPath + "/image/repart.nix")
+  ];
+
   options.services.tiny-deploy = {
     enable = lib.mkEnableOption "tiny-deploy locked-down deployment target";
 
@@ -33,6 +38,7 @@ in {
 
   config = lib.mkIf cfg.enable {
     system.etc.overlay.enable = true;
+
     # ── Nix ───────────────────────────────────────────────────────────────
     nix.enable = false;
 
@@ -121,8 +127,73 @@ in {
     systemd.services."getty@".enable = false;
     systemd.services."serial-getty@".enable = false;
 
+    # ── Bootloader (UEFI + systemd-boot) ──────────────────────────────────
+    # UEFI everywhere: x86 server, aarch64 server, Pi 4/5 via EDK2 (pftf /
+    # worproject), VMs via OVMF. systemd-boot manages generation entries for
+    # deploy-rs rollback. No u-boot, no extlinux, no sd-image machinery.
+    boot.loader.grub.enable = false;
+    boot.loader.generic-extlinux-compatible.enable = false;
+    boot.loader.systemd-boot.enable = true;
+    boot.loader.systemd-boot.configurationLimit = 10;
+    # SBCs with EDK2 firmware generally cannot persist EFI variables.
+    boot.loader.efi.canTouchEfiVariables = false;
+    boot.loader.efi.efiSysMountPoint = "/boot";
+
+    boot.initrd.systemd.enable = true;
+    boot.kernelParams = ["quiet"];
+
+    # ── Filesystems ───────────────────────────────────────────────────────
+    fileSystems."/" = {
+      device = "/dev/disk/by-partlabel/root";
+      fsType = "ext4";
+    };
+    fileSystems."/boot" = {
+      device = "/dev/disk/by-partlabel/ESP";
+      fsType = "vfat";
+      options = ["umask=0077"];
+    };
+
+    # ── Disk image (systemd-repart) ───────────────────────────────────────
+    # Builds a GPT image with an ESP (pre-populated with systemd-boot + a
+    # bootstrap UKI so the image boots on first power-on) and an ext4 root.
+    # On activation, the systemd-boot installer writes per-generation entries
+    # to /boot, so deploy-rs rollback works normally after first boot.
+    system.image.id = lib.mkDefault "tiny-deploy";
+    system.image.version = lib.mkDefault "1";
+
+    image.repart = {
+      name = "tiny-deploy";
+      # OVMF/EDK2 builds expect 512-byte sectors.
+      sectorSize = 512;
+      partitions = {
+        "10-esp" = {
+          contents = {
+            "/EFI/BOOT/BOOT${lib.toUpper pkgs.stdenv.hostPlatform.efiArch}.EFI".source =
+              "${pkgs.systemd}/lib/systemd/boot/efi/systemd-boot${pkgs.stdenv.hostPlatform.efiArch}.efi";
+            "/EFI/Linux/${config.system.boot.loader.ukiFile}".source =
+              "${config.system.build.uki}/${config.system.boot.loader.ukiFile}";
+          };
+          repartConfig = {
+            Type = "esp";
+            Format = "vfat";
+            Label = "ESP";
+            SizeMinBytes = "128M";
+          };
+        };
+        "20-root" = {
+          storePaths = [config.system.build.toplevel];
+          repartConfig = {
+            Type = "root";
+            Format = "ext4";
+            Label = "root";
+            Minimize = "guess";
+          };
+        };
+      };
+    };
+
     # ── Stripped kernel ───────────────────────────────────────────────────
-    # Headless ssh-only deploy shell: rip out anything we don't need.
+    # Headless ssh-only deploy target: rip out anything we don't need.
     # Monolithic kernel (MODULES=n) — no loadable modules exist.
     boot.initrd.availableKernelModules = lib.mkForce [];
     boot.initrd.kernelModules = lib.mkForce [];
@@ -131,198 +202,222 @@ in {
 
     boot.kernelPackages = pkgs.linuxPackagesFor (pkgs.linux.override {
       ignoreConfigErrors = true;
-      structuredExtraConfig = with lib.kernel; lib.mapAttrs (_: lib.mkForce) {
-        # Monolithic kernel: no loadable modules, everything needed is builtin.
-        MODULES = no;
+      structuredExtraConfig = with lib.kernel;
+        lib.mapAttrs (_: lib.mkForce) {
+          # Monolithic kernel: no loadable modules, everything needed is builtin.
+          MODULES = no;
 
-        # ── Boot-critical: force builtin (default =m would become =n) ────
-        # Root filesystem + nix store
-        EXT4_FS = yes;
-        SQUASHFS = yes;
-        SQUASHFS_XZ = yes;
-        SQUASHFS_ZSTD = yes;
-        OVERLAY_FS = yes;
+          # ── Boot-critical: force builtin (default =m would become =n) ──
+          # Root filesystem + nix store
+          EXT4_FS = yes;
+          SQUASHFS = yes;
+          SQUASHFS_XZ = yes;
+          SQUASHFS_ZSTD = yes;
+          OVERLAY_FS = yes;
 
-        # /boot (VFAT)
-        VFAT_FS = yes;
-        FAT_FS = yes;
-        NLS_CODEPAGE_437 = yes;
-        NLS_ASCII = yes;
-        NLS_ISO8859_1 = yes;
-        NLS_UTF8 = yes;
+          # /boot (VFAT ESP)
+          VFAT_FS = yes;
+          FAT_FS = yes;
+          NLS_CODEPAGE_437 = yes;
+          NLS_ASCII = yes;
+          NLS_ISO8859_1 = yes;
+          NLS_UTF8 = yes;
 
-        # SD card (sd-image boots from SD on the pi)
-        MMC = yes;
-        MMC_BLOCK = yes;
-        MMC_SDHCI = yes;
-        MMC_SDHCI_PLTFM = yes;
-        MMC_SDHCI_IPROC = yes;
-        MMC_BCM2835 = yes;
+          # EFI: needed to consume UEFI firmware services and ESP
+          EFI = yes;
+          EFI_STUB = yes;
+          EFI_PARTITION = yes;
+          EFIVAR_FS = yes;
+          EFI_RUNTIME_WRAPPERS = yes;
 
-        # NVMe (pi5 commonly boots off NVMe hat)
-        BLK_DEV_NVME = yes;
-        NVME_CORE = yes;
+          # GPT
+          PARTITION_ADVANCED = yes;
 
-        # USB host + storage + HID
-        USB = yes;
-        USB_SUPPORT = yes;
-        USB_XHCI_HCD = yes;
-        USB_XHCI_PCI = yes;
-        USB_XHCI_PLATFORM = yes;
-        USB_STORAGE = yes;
-        HID = yes;
-        HID_GENERIC = yes;
-        USB_HID = yes;
+          # Storage: NVMe (servers / pi NVMe hat)
+          BLK_DEV_NVME = yes;
+          NVME_CORE = yes;
 
-        # Device tree + pi platform bits
-        OF = yes;
-        DEVTMPFS = yes;
-        DEVTMPFS_MOUNT = yes;
+          # Storage: SATA/AHCI (x86 / arm servers)
+          ATA = yes;
+          SATA_AHCI = yes;
+          SATA_AHCI_PLATFORM = yes;
 
-        # Firewall (nftables)
-        NETFILTER = yes;
-        NF_TABLES = yes;
-        NF_TABLES_INET = yes;
-        NFT_CT = yes;
+          # Storage: virtio (VMs)
+          VIRTIO = yes;
+          VIRTIO_PCI = yes;
+          VIRTIO_BLK = yes;
+          VIRTIO_NET = yes;
+          VIRTIO_MMIO = yes;
 
-        # No audio / media / graphics
-        SOUND = no;
-        MEDIA_SUPPORT = no;
-        DRM = no;
-        FB = no;
-        LOGO = no;
-        BACKLIGHT_CLASS_DEVICE = no;
-        VT = no;
-        AGP = no;
+          # Storage: SD/MMC (pi SD boot; harmless elsewhere)
+          MMC = yes;
+          MMC_BLOCK = yes;
+          MMC_SDHCI = yes;
+          MMC_SDHCI_PLTFM = yes;
 
-        # No wireless / bluetooth / short-range radio
-        WIRELESS = no;
-        CFG80211 = no;
-        MAC80211 = no;
-        BT = no;
-        RFKILL = no;
-        NFC = no;
-        WIMAX = no;
-        HAMRADIO = no;
+          # USB host + storage + HID
+          USB = yes;
+          USB_SUPPORT = yes;
+          USB_XHCI_HCD = yes;
+          USB_XHCI_PCI = yes;
+          USB_XHCI_PLATFORM = yes;
+          USB_STORAGE = yes;
+          HID = yes;
+          HID_GENERIC = yes;
+          USB_HID = yes;
 
-        # No exotic networking
-        CAN = no;
-        IEEE802154 = no;
-        ATM = no;
-        IRDA = no;
-        DECNET = no;
-        APPLETALK = no;
-        X25 = no;
-        LAPB = no;
-        PHONET = no;
-        "6LOWPAN" = no;
-        MPLS = no;
-        L2TP = no;
-        VLAN_8021Q = no;
-        BRIDGE = no;
-        NET_SCHED = no;
-        NET_L3_MASTER_DEV = no;
+          # Device tree + platform bits (ARM SBCs)
+          OF = yes;
+          DEVTMPFS = yes;
+          DEVTMPFS_MOUNT = yes;
 
-        # Filesystems: keep ext4 + vfat, drop the rest
-        BTRFS_FS = no;
-        XFS_FS = no;
-        JFS_FS = no;
-        REISERFS_FS = no;
-        F2FS_FS = no;
-        NILFS2_FS = no;
-        NTFS3_FS = no;
-        HFSPLUS_FS = no;
-        HFS_FS = no;
-        OCFS2_FS = no;
-        GFS2_FS = no;
-        UBIFS_FS = no;
-        AFS_FS = no;
-        CEPH_FS = no;
-        CIFS = no;
-        NFS_FS = no;
-        NFSD = no;
-        "9P_FS" = no;
-        QUOTA = no;
-        AUTOFS_FS = no;
-        FUSE_FS = no;
-        ISO9660_FS = no;
-        UDF_FS = no;
-        MSDOS_FS = no;
-        JFFS2_FS = no;
-        NFS_COMMON = no;
-        SUNRPC = no;
+          # Firewall (nftables)
+          NETFILTER = yes;
+          NF_TABLES = yes;
+          NF_TABLES_INET = yes;
+          NFT_CT = yes;
 
-        # Virtualization: pi is not a hypervisor host
-        KVM = no;
-        XEN = no;
-        HYPERV = no;
-        VIRTUALIZATION = no;
-        PARAVIRT = no;
+          # I/O scheduler: mq-deadline is plenty, drop BFQ
+          # (default =m breaks with MODULES=n)
+          IOSCHED_BFQ = no;
 
-        # Debug / tracing / profiling
-        FTRACE = no;
-        PROFILING = no;
-        KGDB = no;
-        PERF_EVENTS = no;
-        KPROBES = no;
-        UPROBES = no;
+          # No audio / media / graphics
+          SOUND = no;
+          MEDIA_SUPPORT = no;
+          DRM = no;
+          FB = no;
+          LOGO = no;
+          BACKLIGHT_CLASS_DEVICE = no;
+          VT = no;
+          AGP = no;
 
-        # Legacy / unused buses and stacks
-        PCCARD = no;
-        PARPORT = no;
-        MTD = no;
-        THUNDERBOLT = no;
-        FIREWIRE = no;
-        EISA = no;
-        PCI_QUIRKS = no;
+          # No wireless / bluetooth / short-range radio
+          WIRELESS = no;
+          CFG80211 = no;
+          MAC80211 = no;
+          BT = no;
+          RFKILL = no;
+          NFC = no;
+          WIMAX = no;
+          HAMRADIO = no;
 
-        # Power management / hotplug we don't need
-        SUSPEND = no;
-        HIBERNATION = no;
-        MEMORY_HOTPLUG = no;
-        NUMA = no;
-        KEXEC = no;
-        CRASH_DUMP = no;
+          # No exotic networking
+          CAN = no;
+          IEEE802154 = no;
+          ATM = no;
+          IRDA = no;
+          DECNET = no;
+          APPLETALK = no;
+          X25 = no;
+          LAPB = no;
+          PHONET = no;
+          "6LOWPAN" = no;
+          MPLS = no;
+          L2TP = no;
+          VLAN_8021Q = no;
+          BRIDGE = no;
+          NET_SCHED = no;
+          NET_L3_MASTER_DEV = no;
 
-        # Block layer extras
-        MD = no;
-        BLK_DEV_DM = no;
-        BCACHE = no;
-        ZRAM = no;
-        BLK_DEV_NBD = no;
-        BLK_DEV_RBD = no;
-        BLK_DEV_DRBD = no;
+          # Filesystems: keep ext4 + vfat, drop the rest
+          BTRFS_FS = no;
+          XFS_FS = no;
+          JFS_FS = no;
+          REISERFS_FS = no;
+          F2FS_FS = no;
+          NILFS2_FS = no;
+          NTFS3_FS = no;
+          HFSPLUS_FS = no;
+          HFS_FS = no;
+          OCFS2_FS = no;
+          GFS2_FS = no;
+          UBIFS_FS = no;
+          AFS_FS = no;
+          CEPH_FS = no;
+          CIFS = no;
+          NFS_FS = no;
+          NFSD = no;
+          "9P_FS" = no;
+          QUOTA = no;
+          AUTOFS_FS = no;
+          FUSE_FS = no;
+          ISO9660_FS = no;
+          UDF_FS = no;
+          MSDOS_FS = no;
+          JFFS2_FS = no;
+          NFS_COMMON = no;
+          SUNRPC = no;
 
-        # SCSI low-level drivers (keep core for usb-storage)
-        SCSI_LOWLEVEL = no;
-        ATA = no;
+          # Virtualization: deploy target is not a hypervisor host
+          KVM = no;
+          XEN = no;
+          HYPERV = no;
+          VIRTUALIZATION = no;
+          PARAVIRT = no;
 
-        # Sensors / EDAC / misc hardware
-        HWMON = no;
-        EDAC = no;
-        WATCHDOG = no;
-        IIO = no;
+          # Debug / tracing / profiling
+          FTRACE = no;
+          PROFILING = no;
+          KGDB = no;
+          PERF_EVENTS = no;
+          KPROBES = no;
+          UPROBES = no;
 
-        # Input: keep keyboard/mouse core; drop the rest
-        INPUT_JOYSTICK = no;
-        INPUT_TABLET = no;
-        INPUT_TOUCHSCREEN = no;
-        INPUT_MISC = no;
-        JOYSTICK_XPAD = no;
+          # Legacy / unused buses and stacks
+          PCCARD = no;
+          PARPORT = no;
+          MTD = no;
+          THUNDERBOLT = no;
+          FIREWIRE = no;
+          EISA = no;
+          PCI_QUIRKS = no;
 
-        # USB: keep core + hid + storage; drop the rest
-        USB_SERIAL = no;
-        USB_PRINTER = no;
-        USB_VIDEO_CLASS = no;
-        USB_NET_DRIVERS = no;
+          # Power management / hotplug we don't need
+          SUSPEND = no;
+          HIBERNATION = no;
+          MEMORY_HOTPLUG = no;
+          NUMA = no;
+          KEXEC = no;
+          CRASH_DUMP = no;
 
-        # Misc
-        ACCESSIBILITY = no;
-        TABLET = no;
-        FONTS = no;
-        STAGING = no;
-        GAMEPORT = no;
-      };
+          # Block layer extras
+          MD = no;
+          BLK_DEV_DM = no;
+          BCACHE = no;
+          ZRAM = no;
+          BLK_DEV_NBD = no;
+          BLK_DEV_RBD = no;
+          BLK_DEV_DRBD = no;
+
+          # SCSI low-level drivers (keep core for usb-storage)
+          SCSI_LOWLEVEL = no;
+
+          # Sensors / EDAC / misc hardware
+          HWMON = no;
+          EDAC = no;
+          WATCHDOG = no;
+          IIO = no;
+
+          # Input: keep keyboard/mouse core; drop the rest
+          INPUT_JOYSTICK = no;
+          INPUT_TABLET = no;
+          INPUT_TOUCHSCREEN = no;
+          INPUT_MISC = no;
+          JOYSTICK_XPAD = no;
+
+          # USB: keep core + hid + storage; drop the rest
+          USB_SERIAL = no;
+          USB_PRINTER = no;
+          USB_VIDEO_CLASS = no;
+          USB_NET_DRIVERS = no;
+
+          # Misc
+          ACCESSIBILITY = no;
+          TABLET = no;
+          FONTS = no;
+          STAGING = no;
+          GAMEPORT = no;
+        };
     });
 
     # ── Strip environment ─────────────────────────────────────────────────

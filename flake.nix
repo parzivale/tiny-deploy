@@ -39,12 +39,6 @@
             [
               self.nixosModules.default
               hostModule
-              ({modulesPath, ...}: {
-                imports = [
-                  (modulesPath + "/installer/sd-card/sd-image-aarch64.nix")
-                ];
-                sdImage.compressImage = false;
-              })
               {
                 services.tiny-deploy = {
                   enable = true;
@@ -57,7 +51,7 @@
         };
       in {
         nixosConfiguration = nixos;
-        sdImage = nixos.config.system.build.sdImage;
+        image = nixos.config.system.build.image;
         deploy = {
           inherit hostname;
           profiles.system = {
